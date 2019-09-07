@@ -21,6 +21,8 @@ class PyOneFile:
     def close(self):
         if self.mode[0] in ['w', 'a']:
             self.flush()
+            for i in self.fs.listeners:
+                i.onFileWritten(self.fs, self.loc)
         self.f.close()
         return self.id
 
@@ -38,17 +40,31 @@ class PyOneFS:
         else:
             with open(self.corepath) as f:
                 self.files = json.load(f)
+        self.listeners = []
     def flush(self):
         with open(self.corepath, 'w') as f:
             json.dump(self.files, f)
+
+        # tell listeners that the FS metadata was pushed to the disk
+        for i in self.listeners:
+            i.onFlush(self)
     def wr_entry(self, name, data):
         '''returns the UID for the entry, does not flush the filesystem.'''
         vec = hex(random.randint(0,0x10000000))[2:]
+        ident = [name, vec]
         if name in self.files.keys():
+            while vec in self.files[name].keys():
+                vec = hex(random.randint(0,0x10000000))[2:]
             self.files[name][vec] = data
         else:
             self.files[name] = {vec:data}
-        return [name, vec]
+
+        # push data to listeners
+        if data!=None:
+            for i in self.listeners:
+                i.onEntryCreate(self, ident, data)
+                
+        return ident
     def get_entry(self, name):
         if type(name)==list:
             name = name[0]+':'+str(name[1])
@@ -71,18 +87,21 @@ class PyOneFS:
         # directories have a dict in their entries
         ident = self.wr_entry(dirname, {})
         return ident'''
-    def open(self, name, mode = 'r'):
+    def localPathOf(self, ident):
+        name = ident[0]
         ext = name[name.rfind('.'):]
-        i = ext.rfind(':')
-        if i!=-1:
-            ext = ext[:i]
+        return os.path.join(self.loc, ident[1]+'_'+ident[0][:3].replace('/', '_')+ext)
+    def open(self, name, mode = 'r'):
         if mode[0]=='w':
             ident = self.wr_entry(name, None)
         elif mode[0]=='r':
             ident = self.get_entry(name)
         else:
             raise ValueError("Unsupported mode: "+mode)
-        return PyOneFile(self, ident, os.path.join(self.loc, ident[1]+'_'+ident[0][:3].replace('/', '_')+ext), mode, ext)
+
+        ext = ident[0][ident[0].rfind('.'):]
+        
+        return PyOneFile(self, ident, self.localPathOf(ident), mode, ext)
     def ls(self):
         return list(self.files.keys())
     def lsentries(self, name):
@@ -92,3 +111,14 @@ class PyOneFS:
         for i in self.files[name].keys():
             out.append(name+':'+i)
         return out
+    def addFsChangeListener(self, lis):
+        self.listeners.append(lis)
+class FsChangeListener:
+    def __init__(self):
+        pass
+    def onFlush(self, fs):
+        pass
+    def onEntryCreate(self, fs, ident, data):
+        pass
+    def onFileWritten(self, fs, location):
+        pass
