@@ -65,6 +65,19 @@ class PyOneFS:
                 i.onEntryCreate(self, ident, data)
                 
         return ident
+    def try_create_entry(self, ident, data):
+        '''Creates an entry if possible.  Returns True on success, False otherwise.  Made for P2P networking.
+Does not notify listeners.  Does not flush the filesystem.'''
+        vec = ident[1]
+        name = ident[0]
+        if name in self.files.keys():
+            if vec in self.files[name].keys():
+                return False
+            self.files[name][vec] = data
+        else:
+            self.files[name] = {vec:data}
+                
+        return True
     def get_entry(self, name):
         if type(name)==list:
             name = name[0]+':'+str(name[1])

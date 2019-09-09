@@ -34,11 +34,12 @@ class Manager(pyonefs.FsChangeListener):
         context.verify_mode = ssl.CERT_REQUIRED
         context.load_cert_chain(certfile=certfile, keyfile=keyfile)
         context.load_verify_locations(cafile=verifier_cert)
+        self.context = context
 
         if serve:
             sok = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sok.bind((adr, port))
-            sok.listen()
+            sok.listen(5)
             _thread.start_new_thread(self.__server__, (sok,))
         self.fs_changes = []
         self.new_files = []
@@ -47,12 +48,13 @@ class Manager(pyonefs.FsChangeListener):
         socket.setblocking(False)
         self.peers.append(Peer(socket, self))
     def connectPeer(self, ip):
-        sok = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sok.setblocking(False)
+        sok = self.context.wrap_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM), server_side = False)
         try:
             sok.connect((ip, self.port))
         except BlockingIOError:
             pass
+        sok.setblocking(False)
+        #print("SSL established. Peer: {}".format(sok.getpeercert()))
         self.addPeer(sok)
     def sync(self):
         for i in self.peers:
@@ -61,7 +63,7 @@ class Manager(pyonefs.FsChangeListener):
         while True:
             con, adr = sok.accept()
             print("Incoming connection from", adr)
-            self.addPeer(con)
+            self.addPeer(self.context.wrap_socket(con, server_side = True))
     def onFlush(self, fs):
         pass
     def onEntryCreate(self, fs, ident, data):
@@ -100,6 +102,7 @@ class Peer:
         self.inbuffer = b''
         self.current_command = -1
         self.state = 0
+        self.state_val = None
     def sync(self):
         pass
     def pushFsChange(self, ident, data, fn, epath):
@@ -131,11 +134,45 @@ class Peer:
             self.inbuffer+=tmp
         except BlockingIOError:
             return # if there's no new data then just leave the function
-        if state==0:
-            # reading new command byte
-            # for now I will not support authentication
-            cmd = self.inbuffer[0] & 255
-            
+        
+        cmd = self.current_command
+        # breaks when it needs more data to parse
+        while True:
+            if self.state==0:
+                # reading new command byte
+                # for now I will not support authentication
+                self.current_command = cmd = self.inbuffer[0] & 255
+
+                self.state = 1
+                self.inbuffer = self.inbuffer[1:]
+            elif self.state==1:
+                if cmd==COMMAND_PUSH_FS_CHANGE:
+                    if len(self.inbuffer)<2:
+                        break
+                    # store size of packet content in state_val
+                    self.state_val = int.from_bytes(self.inbuffer[:2], 'little')
+                    self.inbuffer=self.inbuffer[2:]
+                self.state = 2
+            elif self.state==2:
+                if cmd==COMMAND_PUSH_FS_CHANGE:
+                    # make sure more can be loaded
+                    if len(self.inbuffer)<self.state_val:
+                        break
+                    ident, data, epath = json.loads(self.inbuffer[:self.state_val])
+                    self.inbuffer = self.inbuffer[self.state_val:]
+                    self.man.fs.try_create_entry(ident, data)
+                    self.state_val = [epath, -1]
+                self.state = 3
+            elif self.state==3:
+                if cmd==COMMAND_PUSH_FS_CHANGE:
+                    # 4 bytes to encode length of file
+                    if len(self.inbuffer)<4:
+                        break
+                    self.state_val[1] = int.from_bytes(self.inbuffer[:4], 'little')
+                    self.inbuffer = self.inbuffer[4:]
+                self.state = 4
+            elif self.state==4:
+                
 '''
 class PeerCommand:
     def __init__(self, command, data, keypair=None):
