@@ -7,6 +7,14 @@ COMMAND_GET_FS_JSON = 1
 COMMAND_RETURN_FS_JSON = 2
 COMMAND_GET_FILE = 3
 
+cmd_strs = {
+    -1:'IDLE',
+    0:'COMMAND_PUSH_FS_CHANGE',
+    1:'COMMAND_GET_FS_JSON',
+    2:'COMMAND_RETURN_FS_JSON',
+    3:'COMMAND_GET_FILE'
+}
+
 DEFAULT_PORT = 1152
 
 class KeyPair:
@@ -52,7 +60,8 @@ class Manager(pyonefs.FsChangeListener):
         self.port = port
     def addPeer(self, socket):
         socket.setblocking(0)
-        self.peers.append(Peer(socket, self))
+        peer = Peer(socket, self)
+        self.peers.append(peer)
     def connectPeer(self, ip):
         sok = self.context.wrap_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM), server_side = False)
         try:
@@ -76,7 +85,7 @@ class Manager(pyonefs.FsChangeListener):
             for i in self.peers:
                 try:
                     i.update()
-                except:
+                except ssl.SSLError:
                     to_rm.append(i)
             for i in to_rm:
                 self.peers.remove(i)
@@ -106,12 +115,10 @@ class Manager(pyonefs.FsChangeListener):
         for i in range(len(self.new_files)):
             if self.new_files[i][0]==ident:
                 filechange_idx = i
-
-        fn = self.new_files[filechange_idx][1]
-        idx = fn.rfind('/')
-        epath = fn[idx+1:]
+        self.new_files.pop(filechange_idx)
+        self.fs_changes.pop(fschange_idx)
         for i in self.peers:
-            i.pushFsChange(ident, self.fs_changes[fschange_idx], fn, epath)
+            i.pushFsChange(ident)
 class Peer:
     def __init__(self, socket, manager):
         self.sok = socket
@@ -121,7 +128,7 @@ class Peer:
         self.current_command = -1
         self.state = 0
         self.state_val = None
-        self.sync()
+        self.isSynced = False
     def __send_file__(self, filepath):
         with open(filepath, 'rb') as f:
             # get file size
@@ -141,7 +148,12 @@ class Peer:
         # the peer will send back their filesystem JSON, which we can compare to our own filesystem.
         # This comparison allows us to know what entries need to be created and files downloaded.
         # The first step is asking for the remote filesystem JSON.
-    def pushFsChange(self, ident, data, fn, epath):
+        self.isSynced = True
+    def pushFsChange(self, ident):
+        fn = self.man.fs.localPathOf(ident)
+        idx = fn.rfind('/')
+        epath = fn[idx+1:]
+        data = self.man.fs.files[ident[0]][ident[1]]
         with open(fn, 'rb') as f:
             # get file size
             f.seek(0,2)
@@ -167,7 +179,7 @@ class Peer:
         self.__send_file__(self.man.fs.corepath)
     def requestFileFromIdent(self, ident):
         packet_content = json.dumps(ident)
-        self.sok.sendall(bytes([COMMAND_RETURN_FS_JSON])+len(packet_content).to_bytes(2, 'little')+packet_content.encode())
+        self.sok.sendall(bytes([COMMAND_GET_FILE])+len(packet_content).to_bytes(2, 'little')+packet_content.encode())
         
     def update(self):
         try:
@@ -179,11 +191,18 @@ class Peer:
             self.inbuffer+=tmp
         except (BlockingIOError, ssl.SSLError):
             return # if there's no new data then just leave the function
+
+        if not self.isSynced:
+            self.sync()
         
         cmd = self.current_command
         # breaks when it needs more data to parse
-        while len(self.inbuffer)>0:
+        while True:
+            #print('{   '+repr(self)+' '+str(self.state)+' '+cmd_strs[cmd]+'\n')
             if self.state==0:
+                if len(self.inbuffer)==0:
+                    self.state = 0
+                    break
                 # reading new command byte
                 # for now I will not support authentication
                 self.current_command = cmd = self.inbuffer[0] & 255
@@ -192,37 +211,43 @@ class Peer:
                 self.inbuffer = self.inbuffer[1:]
             elif self.state==1:
                 self.state = 2
-                if cmd==COMMAND_PUSH_FS_CHANGE:
+                if cmd==COMMAND_PUSH_FS_CHANGE or cmd==COMMAND_GET_FILE:
                     if len(self.inbuffer)<2:
+                        self.state = 1
                         break
                     # store size of packet content in state_val
                     self.state_val = int.from_bytes(self.inbuffer[:2], 'little')
                     self.inbuffer=self.inbuffer[2:]
                 elif cmd==COMMAND_GET_FS_JSON:
                     self.sendFsJson()
+
+                    # now return to state zero
                     self.state = 0
                 elif cmd==COMMAND_RETURN_FS_JSON:
                     # got the new JSON, need to read 4-byte file length
                     if len(self.inbuffer)<4:
+                        self.state = 1
                         break
                     self.state_val = int.from_bytes(self.inbuffer[:4], 'little')
                     self.inbuffer=self.inbuffer[4:]
                     
-                    ''' INSERT HONEYPOT FOR MEMORY ATTACK HERE
-                          Essentially, someone could claim their JSON is 4GB in size, and send 4GB of data.
-                          Doing this would waste 4GB of RAM, which is not trivial.  A honeypot could be created
-                          here to protect the machine running this software and attack the attacker.'''
-                    ''' INSERT HONEYPOT FOR CPU USAGE ATTACK HERE
-                          An attacker could send large, valid JSON filesystems in quick succession.  These need
-                          to be compared, which requires a large CPU overhead.  The quick succession could result
-                          in the Python script using all or almost all of it's available computing power,
-                          basically a denial of service attack.'''
+                    # INSERT HONEYPOT FOR MEMORY ATTACK HERE
+                    #     Essentially, someone could claim their JSON is 4GB in size, and send 4GB of data.
+                    #     Doing this would waste 4GB of RAM, which is not trivial.  A honeypot could be created
+                    #     here to protect the machine running this software and attack the attacker.
+                    
+                    # INSERT HONEYPOT FOR CPU USAGE ATTACK HERE
+                    #     An attacker could send large, valid JSON filesystems in quick succession.  These need
+                    #     to be compared, which requires a large CPU overhead.  The quick succession could result
+                    #     in the Python script using all or almost all of it's available computing power,
+                    #     basically a denial of service attack.
 
             elif self.state==2:
                 self.state = 3
                 if cmd==COMMAND_PUSH_FS_CHANGE:
                     # make sure more can be loaded
                     if len(self.inbuffer)<self.state_val:
+                        self.state = 2
                         break
                     ident, data, epath = json.loads(self.inbuffer[:self.state_val])
                     self.inbuffer = self.inbuffer[self.state_val:]
@@ -232,38 +257,53 @@ class Peer:
                     if not os.path.isfile(loc):
                         q = open(loc, 'wb')
                     self.state_val = [q, -1]
+                elif cmd==COMMAND_GET_FILE:
+                    ident = json.loads(self.inbuffer[:self.state_val])
+                    self.inbuffer = self.inbuffer[self.state_val:]
+
+                    print("Sending", ident, 'to peer as requested')
+                    # this will send the peer all the data it needs
+                    self.pushFsChange(ident)
+
+                    # now return to state zero
+                    self.state = 0
                 elif cmd==COMMAND_RETURN_FS_JSON:
                     # load the entire JSON in the buffer first
                     if len(self.inbuffer)<self.state_val:
+                        self.state = 2
                         break
                     fs_data = json.loads(self.inbuffer[:self.state_val])
                     self.inbuffer = self.inbuffer[self.state_val:]
 
                     # now we have the FS data, time to compare.
-                    new_ident_data = {}
                     for k, v in fs_data.items():
-                        if i in fs.files.keys():
+                        print("[sync] checking ",k)
+                        if k in self.man.fs.files.keys():
                             # the key is there; are there new file versions though?
                             for val in v.keys():
-                                if not val in fs.files[i].keys():
+                                if not val in self.man.fs.files[i].keys():
                                     # a new entry
                                     ident = [k, val]
-                                    new_ident_data[ident] = v[val]
                                     self.requestFileFromIdent(ident)
+                                    print('[sync] requesting',ident)
                         else:
                             # a new key entirely!
                             for val in v.keys():
                                 ident = [k, val]
-                                new_ident_data[ident] = v[val]
                                 self.requestFileFromIdent(ident)
+                                print('[sync] requesting',ident)
+
+                    # now return to state zero
+                    self.state = 0
             elif self.state==3:
+                self.state = 4
                 if cmd==COMMAND_PUSH_FS_CHANGE:
                     # 4 bytes to encode length of file
                     if len(self.inbuffer)<4:
+                        self.state = 3
                         break
                     self.state_val[1] = int.from_bytes(self.inbuffer[:4], 'little')
                     self.inbuffer = self.inbuffer[4:]
-                self.state = 4
             elif self.state==4:
                 if cmd==COMMAND_PUSH_FS_CHANGE:
                     f = self.state_val[0]
@@ -278,17 +318,14 @@ class Peer:
                     if len(next_data)==self.state_val[1]:
                         self.state = 0  # all data is read, more may be in buffer.
                         f.close()
+                        self.man.fs.flush()
                     else:
                         self.state = 4  # more to read; break & wait for more data to be available
                         self.state_val[1]-=len(next_data)
+                        self.state = 4
                         break
-                        
-'''
-class PeerCommand:
-    def __init__(self, command, data, keypair=None):
-        data = bytes([command])+data
-        self.isSigned = keypair!=None
-        if keypair==None:
-            self.data = len(data).to_bytes(4, 'little') + data
-        else:
-            self.data = keypair.sign(data) + len(data).to_bytes(4, 'little') + data'''
+            #print(repr(self)+' '+str(self.state)+' '+cmd_strs[cmd]+'  }\n')
+
+if __name__=='__main__':                      
+    fs = pyonefs.PyOneFS('./fs')
+    man = Manager(fs)
