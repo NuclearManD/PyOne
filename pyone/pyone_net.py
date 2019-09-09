@@ -1,8 +1,11 @@
-import socket, _thread, pyonefs, ecdsa, json, math, ssl, os
+import socket, _thread, pyonefs, ecdsa, json, math, ssl, os, time
 
 COMMAND_SIGNED_FLAG = 128
 
 COMMAND_PUSH_FS_CHANGE = 0
+COMMAND_GET_FS_JSON = 1
+COMMAND_RETURN_FS_JSON = 2
+COMMAND_GET_FILE = 3
 
 DEFAULT_PORT = 1152
 
@@ -43,6 +46,7 @@ class Manager(pyonefs.FsChangeListener):
             sok.bind((adr, port))
             sok.listen(5)
             _thread.start_new_thread(self.__server__, (sok,))
+        _thread.start_new_thread(self.__peerupdate__, ())
         self.fs_changes = []
         self.new_files = []
         self.port = port
@@ -66,6 +70,17 @@ class Manager(pyonefs.FsChangeListener):
             con, adr = sok.accept()
             print("Incoming connection from", adr)
             self.addPeer(self.context.wrap_socket(con, server_side = True))
+    def __peerupdate__(self):
+        while True:
+            to_rm = []
+            for i in self.peers:
+                try:
+                    i.update()
+                except:
+                    to_rm.append(i)
+            for i in to_rm:
+                self.peers.remove(i)
+            time.sleep(.01)
     def onFlush(self, fs):
         pass
     def onEntryCreate(self, fs, ident, data):
@@ -106,8 +121,26 @@ class Peer:
         self.current_command = -1
         self.state = 0
         self.state_val = None
+        self.sync()
+    def __send_file__(self, filepath):
+        with open(filepath, 'rb') as f:
+            # get file size
+            f.seek(0,2)
+            f_size = f.tell()
+            
+            # go back to the beginning
+            f.seek(0)
+
+            # send file data in 2048 byte chunks to avoid wasting memory
+            self.sok.sendall(f_size.to_bytes(4, 'little'))
+            for i in range(math.ceil(f_size/2048)):
+                self.sok.sendall(f.read(2048))
     def sync(self):
-        pass
+        # this command initiates the synchronization process.
+        self.sok.sendall(bytes([COMMAND_GET_FS_JSON]))
+        # the peer will send back their filesystem JSON, which we can compare to our own filesystem.
+        # This comparison allows us to know what entries need to be created and files downloaded.
+        # The first step is asking for the remote filesystem JSON.
     def pushFsChange(self, ident, data, fn, epath):
         with open(fn, 'rb') as f:
             # get file size
@@ -121,12 +154,21 @@ class Peer:
             packet_content = json.dumps([ident, data, epath])
 
             # send command and header data
-            self.sok.send(bytes([COMMAND_PUSH_FS_CHANGE])+len(packet_content).to_bytes(2, 'little')+packet_content.encode())
+            self.sok.sendall(bytes([COMMAND_PUSH_FS_CHANGE])+len(packet_content).to_bytes(2, 'little')+packet_content.encode())
 
-            # send file data
-            self.sok.send(f_size.to_bytes(4, 'little'))
+            # send file data in 2048 byte chunks to avoid wasting memory
+            self.sok.sendall(f_size.to_bytes(4, 'little'))
             for i in range(math.ceil(f_size/2048)):
-                self.sok.send(f.read(2048))
+                self.sok.sendall(f.read(2048))
+    def sendFsJson(self):
+        # send command
+        self.sok.sendall(bytes([COMMAND_RETURN_FS_JSON]))
+        # we want to send only what has been flushed to the disk
+        self.__send_file__(self.man.fs.corepath)
+    def requestFileFromIdent(self, ident):
+        packet_content = json.dumps(ident)
+        self.sok.sendall(bytes([COMMAND_RETURN_FS_JSON])+len(packet_content).to_bytes(2, 'little')+packet_content.encode())
+        
     def update(self):
         try:
             tmp = self.sok.recv(8192)
@@ -149,14 +191,35 @@ class Peer:
                 self.state = 1
                 self.inbuffer = self.inbuffer[1:]
             elif self.state==1:
+                self.state = 2
                 if cmd==COMMAND_PUSH_FS_CHANGE:
                     if len(self.inbuffer)<2:
                         break
                     # store size of packet content in state_val
                     self.state_val = int.from_bytes(self.inbuffer[:2], 'little')
                     self.inbuffer=self.inbuffer[2:]
-                self.state = 2
+                elif cmd==COMMAND_GET_FS_JSON:
+                    self.sendFsJson()
+                    self.state = 0
+                elif cmd==COMMAND_RETURN_FS_JSON:
+                    # got the new JSON, need to read 4-byte file length
+                    if len(self.inbuffer)<4:
+                        break
+                    self.state_val = int.from_bytes(self.inbuffer[:4], 'little')
+                    self.inbuffer=self.inbuffer[4:]
+                    
+                    ''' INSERT HONEYPOT FOR MEMORY ATTACK HERE
+                          Essentially, someone could claim their JSON is 4GB in size, and send 4GB of data.
+                          Doing this would waste 4GB of RAM, which is not trivial.  A honeypot could be created
+                          here to protect the machine running this software and attack the attacker.'''
+                    ''' INSERT HONEYPOT FOR CPU USAGE ATTACK HERE
+                          An attacker could send large, valid JSON filesystems in quick succession.  These need
+                          to be compared, which requires a large CPU overhead.  The quick succession could result
+                          in the Python script using all or almost all of it's available computing power,
+                          basically a denial of service attack.'''
+
             elif self.state==2:
+                self.state = 3
                 if cmd==COMMAND_PUSH_FS_CHANGE:
                     # make sure more can be loaded
                     if len(self.inbuffer)<self.state_val:
@@ -169,7 +232,30 @@ class Peer:
                     if not os.path.isfile(loc):
                         q = open(loc, 'wb')
                     self.state_val = [q, -1]
-                self.state = 3
+                elif cmd==COMMAND_RETURN_FS_JSON:
+                    # load the entire JSON in the buffer first
+                    if len(self.inbuffer)<self.state_val:
+                        break
+                    fs_data = json.loads(self.inbuffer[:self.state_val])
+                    self.inbuffer = self.inbuffer[self.state_val:]
+
+                    # now we have the FS data, time to compare.
+                    new_ident_data = {}
+                    for k, v in fs_data.items():
+                        if i in fs.files.keys():
+                            # the key is there; are there new file versions though?
+                            for val in v.keys():
+                                if not val in fs.files[i].keys():
+                                    # a new entry
+                                    ident = [k, val]
+                                    new_ident_data[ident] = v[val]
+                                    self.requestFileFromIdent(ident)
+                        else:
+                            # a new key entirely!
+                            for val in v.keys():
+                                ident = [k, val]
+                                new_ident_data[ident] = v[val]
+                                self.requestFileFromIdent(ident)
             elif self.state==3:
                 if cmd==COMMAND_PUSH_FS_CHANGE:
                     # 4 bytes to encode length of file
