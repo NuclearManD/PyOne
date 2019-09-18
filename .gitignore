@@ -103,6 +103,6 @@ venv.bak/
 # mypy
 .mypy_cache/
 
-pyone/certs/*
+certs/*
 pyone/fs/*
 
