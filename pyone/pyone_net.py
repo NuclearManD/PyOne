@@ -1,5 +1,5 @@
-import socket, _thread, pyonefs, ecdsa, json, math, ssl, os, time
-
+import socket, _thread, ecdsa, json, math, ssl, os, time
+from . import pyonefs
 COMMAND_SIGNED_FLAG = 128
 
 COMMAND_PUSH_FS_CHANGE = 0
