@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="nuclaer-pyone",
-    version="0.0.0",
+    version="0.0.1",
     author="Dylan Brophy",
     author_email="dylanbrophy@gmail.com",
     description="Decentralized data storage framework",
