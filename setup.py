@@ -14,7 +14,7 @@ setuptools.setup(
     url="https://github.com/NuclearManD/PyOne",
     packages=setuptools.find_packages(),
     install_requires=[
-          'ecdsa', 'ssl'
+          'ecdsa'
       ],
     classifiers=[
         "Programming Language :: Python :: 3",
